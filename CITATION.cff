@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this dataset or code, please cite the paper and this repository."
+title: "Replication data and code: The gendering of scientific roles in childhood is produced by mixed-gender groups"
+authors:
+  - family-names: Pollo
+    given-names: ""
+  - family-names: Kasumovic
+    given-names: Michael M.
+    affiliation: "UNSW Sydney"
+date-released: 2026-07-06
+license: MIT
+keywords:
+  - gender
+  - STEM
+  - science education
+  - group composition
+  - childhood
+  - developmental
+preferred-citation:
+  type: article
+  title: "The gendering of scientific roles in childhood is produced by mixed-gender groups, not carried into them"
+  authors:
+    - family-names: Pollo
+      given-names: ""
+    - family-names: Kasumovic
+      given-names: Michael M.
+  year: 2026

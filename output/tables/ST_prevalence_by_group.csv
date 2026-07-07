@@ -1,0 +1,16 @@
+field,team_gender,pct,teams
+Biological,only boys,22.164948453608247,194
+Biological,mixed,26.978417266187048,278
+Biological,only girls,30.508474576271187,118
+Chemical,only boys,18.556701030927837,194
+Chemical,mixed,23.381294964028775,278
+Chemical,only girls,21.1864406779661,118
+DAT,only boys,12.886597938144329,194
+DAT,mixed,6.474820143884892,278
+DAT,only girls,5.084745762711865,118
+Earth_and_Space,only boys,38.144329896907216,194
+Earth_and_Space,mixed,39.20863309352518,278
+Earth_and_Space,only girls,39.83050847457627,118
+Physical,only boys,21.649484536082475,194
+Physical,mixed,14.388489208633093,278
+Physical,only girls,5.932203389830509,118

@@ -1,0 +1,791 @@
+---
+title: "Gendered role choice in a primary-school STEAM challenge — replication analysis"
+author: "Pollo, Kasumovic et al."
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    embed-resources: true
+    df-print: paged
+execute:
+  warning: false
+  message: false
+knitr:
+  opts_chunk:
+    fig.path: "output/figures/"
+    dpi: 600
+---
+
+This document reproduces every figure and table in the paper *"The gendering of
+scientific roles in childhood is produced by mixed-gender groups, not carried
+into them"* from the **de-identified** data in `data/`. It contains no
+identifiable information and can be run by anyone who clones the repository.
+
+The internal pipeline that produced the de-identified files is documented in
+`R/00_deidentify.R` (it requires the raw, identifiable master, which is **not**
+distributed). Nothing here depends on that script having been re-run.
+
+Model specifications follow the analysis plan and the internal scripts
+`analysis.R` (M0–M3) and `03_followups.R` (FU1–FU6); only the data-loading and
+column names differ, because the released data use dummy school/class IDs and a
+within-team `student_id` in place of first names.
+
+```{r setup}
+suppressMessages({
+  library(tidyverse)
+  library(glmmTMB)     # GLMMs
+  library(emmeans)     # estimated marginal means + contrasts
+  library(survival)    # clogit()
+  library(broom)
+})
+have_logistf <- requireNamespace("logistf", quietly = TRUE)
+if (have_logistf) suppressMessages(library(logistf))
+
+set.seed(1234)
+options(width = 110)
+
+fig_dir <- "output/figures"; tab_dir <- "output/tables"
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(tab_dir, recursive = TRUE, showWarnings = FALSE)
+save_tab <- function(x, name) { readr::write_csv(as.data.frame(x), file.path(tab_dir, name)); invisible(x) }
+
+theme_set(theme_classic(base_size = 14) +
+            theme(axis.title  = element_text(size = 15),
+                  axis.text   = element_text(size = 13),
+                  legend.text = element_text(size = 12),
+                  legend.position = "top"))
+
+# tidy role labels for axes/legends (capitalised, no underscores)
+role_labels <- c(team_captain = "Team Captain", project_manager = "Project Manager",
+                 art_lead = "Art Lead", mechanics_lead = "Mechanics Lead",
+                 narrative_designer = "Narrative Designer",
+                 communication_lead = "Communication Lead",
+                 head_scientist = "Head Scientist")
+
+stem_roles      <- c("head_scientist", "mechanics_lead")
+team_gender_lvl <- c("only boys", "mixed", "only girls",
+                     "boys + unknown", "girls + unknown", "only unknown")
+roles_2023  <- c("team_captain","project_manager","art_lead","mechanics_lead","communication_lead")
+roles_other <- c("team_captain","project_manager","art_lead","mechanics_lead","narrative_designer","head_scientist")
+pure3       <- c("only boys", "mixed", "only girls")
+```
+
+## 1. Load de-identified data and build analysis frames
+
+```{r load}
+roles <- read_csv("data/gdc_roles_deidentified.csv", show_col_types = FALSE)
+topics <- read_csv("data/gdc_topics_deidentified.csv", show_col_types = FALSE)
+
+glimpse(roles)
+```
+
+`roles` has one row per filled, non-custom role slot (i.e. one row per student in
+a role). `student_id` is a within-team index that is stable across the roles a
+single student holds, so students who fill more than one role are correctly
+counted once when computing team composition.
+
+```{r frames}
+ensure_cols <- function(df, cols) { for (c in cols) if (!c %in% names(df)) df[[c]] <- 0L; df }
+
+build_frames <- function(long) {
+  df_teams <- long %>%
+    distinct(team_id, year, school_id, class_id, team_coed, student_id, gender_adj) %>%
+    count(team_id, year, school_id, class_id, team_coed, gender_adj) %>%
+    pivot_wider(names_from = gender_adj, values_from = n, values_fill = 0) %>%
+    ensure_cols(c("female","male","unknown")) %>%
+    mutate(team_size  = female + male + unknown,
+           prop_boys  = male   / pmax(female + male, 1),
+           prop_girls = female / pmax(female + male, 1),
+           team_gender = case_when(
+             female > 0 & male > 0                   ~ "mixed",
+             female > 0 & male == 0 & unknown == 0   ~ "only girls",
+             male   > 0 & female == 0 & unknown == 0 ~ "only boys",
+             female > 0 & male == 0 & unknown  > 0   ~ "girls + unknown",
+             male   > 0 & female == 0 & unknown  > 0 ~ "boys + unknown",
+             TRUE                                    ~ "only unknown")) %>%
+    filter(team_size %in% 3:6)
+
+  df_students <- long %>%
+    filter(!str_detect(role, "custom_role")) %>%          # custom roles: composition only
+    inner_join(df_teams %>% dplyr::select(team_id, female, male, unknown, team_size,
+                                          prop_boys, prop_girls, team_gender),
+               by = "team_id") %>%
+    mutate(stem        = as.integer(role %in% stem_roles),
+           role        = factor(role),
+           year        = factor(year),
+           gender_adj  = factor(gender_adj, levels = c("female","male","unknown")),
+           team_gender = factor(team_gender, levels = team_gender_lvl))
+
+  df_fill <- df_teams %>%
+    mutate(roles_offered = ifelse(year == 2023, list(roles_2023), list(roles_other))) %>%
+    unnest(roles_offered) %>% rename(role = roles_offered) %>%
+    left_join(df_students %>% distinct(team_id, role) %>% mutate(filled = 1L),
+              by = c("team_id", "role")) %>%
+    mutate(filled      = replace_na(filled, 0L),
+           stem        = as.integer(role %in% stem_roles),
+           team_gender = factor(team_gender, levels = team_gender_lvl),
+           role        = factor(role),
+           year        = factor(year))
+
+  list(df_teams = df_teams, df_students = df_students, df_fill = df_fill)
+}
+
+fr <- build_frames(roles)
+df_teams <- fr$df_teams; df_students <- fr$df_students; df_fill <- fr$df_fill
+
+# school-constant context, one row per dummy school (for FU3)
+first_present <- function(x) { bad <- is.na(x) | (is.character(x) & x == ""); if (any(!bad)) x[!bad][1] else x[1] }
+school_ctx <- roles %>% group_by(school_id) %>%
+  summarise(across(c(school_icsea, sector, locale, school_single_sex), first_present), .groups = "drop")
+
+cat("teams:", nrow(df_teams), " student role-slots:", nrow(df_students),
+    " team x offered-role rows:", nrow(df_fill), "\n")
+```
+
+### Sample description (Methods; Table 1)
+
+```{r sample}
+# gender assignment audit
+students_distinct <- df_students %>% distinct(team_id, student_id, gender_adj)
+cat("Distinct students:", nrow(students_distinct), "\n")
+print(students_distinct %>% count(gender_adj))
+
+# Table 1: teams by composition x year
+tab1 <- df_teams %>% count(year, team_gender) %>%
+  pivot_wider(names_from = year, values_from = n, values_fill = 0) %>%
+  mutate(team_gender = factor(team_gender, levels = team_gender_lvl)) %>% arrange(team_gender)
+tab1 %>% mutate(Total = rowSums(across(where(is.numeric)))) %>%
+  save_tab("Table1_team_composition.csv")
+print(tab1)
+```
+
+## 2. Team formation (Figure 1)
+
+Given each class's gender composition, are there fewer mixed teams than expected
+if teams formed at random within class? Excludes single-sex schools and one-team
+classes; the 2025 cohort has no team `%`-girls and is naturally excluded.
+
+```{r m0}
+df_teams_subset <- df_teams %>%
+  filter(team_coed == TRUE) %>%                    # co-ed schools, known composition
+  group_by(year, school_id, class_id) %>%
+  mutate(n_teams_in_class = n()) %>% ungroup() %>%
+  filter(n_teams_in_class > 1)
+
+cat("M0 input:", nrow(df_teams_subset), "teams in",
+    n_distinct(paste(df_teams_subset$school_id, df_teams_subset$class_id)), "classes\n")
+
+randomise.team.gender <- function(n_loops = 1000) {
+  teams_per_school <- df_teams_subset %>% arrange(school_id, class_id) %>%
+    dplyr::select(team_id, team_size) %>% uncount(team_size)
+  students_per_school <- df_teams_subset %>%
+    group_by(school_id, class_id) %>%
+    summarise(f = sum(female), m = sum(male), u = sum(unknown), .groups = "drop") %>%
+    pivot_longer(c(f, m, u), names_to = "gender") %>% uncount(value)
+  out <- vector("list", n_loops)
+  for (i in seq_len(n_loops)) {
+    out[[i]] <- students_per_school %>%
+      group_by(school_id, class_id) %>% slice_sample(prop = 1) %>% ungroup() %>%
+      bind_cols(teams_per_school, loop = i) %>%
+      count(loop, school_id, class_id, team_id, gender) %>%
+      pivot_wider(names_from = gender, values_from = n) %>%
+      mutate(across(c(f, m, u), ~ replace_na(., 0)),
+             team_gender = case_when(
+               f > 0 & m > 0  ~ "mixed",
+               f > 0 & u > 0  ~ "girls + unknown",
+               f > 0 & u == 0 ~ "only girls",
+               m > 0 & u > 0  ~ "boys + unknown",
+               m > 0 & u == 0 ~ "only boys",
+               u > 0          ~ "only unknown")) %>%
+      count(loop, team_gender)
+  }
+  bind_rows(out)
+}
+
+set.seed(1234)
+randomised <- randomise.team.gender(1000)
+expected_tg <- randomised %>% complete(loop, team_gender, fill = list(n = 0)) %>%
+  group_by(loop) %>% mutate(total = sum(n)) %>% ungroup() %>% mutate(prop = n / total) %>%
+  group_by(team_gender) %>%
+  summarise(avg_prop = mean(prop), se = sd(prop) / sqrt(n()),
+            lower = avg_prop - 1.96 * se, upper = avg_prop + 1.96 * se, .groups = "drop")
+observed_tg <- df_teams_subset %>% count(team_gender) %>% mutate(obs_prop = n / sum(n))
+
+fig1_dat <- full_join(observed_tg, expected_tg, by = "team_gender") %>%
+  mutate(obs_prop = replace_na(obs_prop, 0),
+         team_gender = factor(team_gender, levels = team_gender_lvl)) %>% arrange(team_gender)
+save_tab(fig1_dat, "M0_team_formation.csv"); print(fig1_dat)
+
+fig1 <- ggplot(fig1_dat, aes(team_gender)) +
+  geom_col(aes(y = obs_prop), fill = "grey75", width = 0.65) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.18, colour = "firebrick") +
+  geom_point(aes(y = avg_prop), colour = "firebrick", size = 2.4) +
+  scale_x_discrete(labels = function(x) str_replace_all(x, " ", "\n")) +
+  labs(x = NULL, y = "Proportion of teams") + ylim(0, NA)
+ggsave(file.path(fig_dir, "fig1_team_formation.png"), fig1, width = 7.5, height = 5, dpi = 600)
+fig1
+```
+
+## 3. Role importance (Question 2; Figures 2–3)
+
+```{r fig2}
+# raw fill rate per role, among teams offered it (role menus are year-confounded,
+# so a year-adjusted model would extrapolate roles into years never offered).
+emm_role <- df_fill %>% group_by(role) %>%
+  summarise(n = n(), k = sum(filled), prob = k / n, .groups = "drop") %>%
+  rowwise() %>%
+  mutate(asymp.LCL = prop.test(k, n)$conf.int[1],
+         asymp.UCL = prop.test(k, n)$conf.int[2]) %>% ungroup() %>%
+  mutate(stem = ifelse(as.character(role) %in% stem_roles, "STEM", "non-STEM"),
+         # y-axis label carries the tidy role name AND its sample size (was Table 3)
+         role_lab = paste0(role_labels[as.character(role)], "\n(n = ", n, ")"),
+         role_lab = fct_reorder(role_lab, prob))
+save_tab(emm_role, "Fig2_role_importance.csv"); print(emm_role)
+
+fig2 <- ggplot(emm_role, aes(prob, role_lab, colour = stem, shape = stem)) +
+  geom_errorbarh(aes(xmin = asymp.LCL, xmax = asymp.UCL), height = 0.2, linewidth = 0.7) +
+  geom_point(size = 3.6) +
+  # colourblind-safe (Okabe-Ito) + distinct shapes, so STEM/non-STEM differ by both
+  scale_colour_manual(values = c("STEM" = "#D55E00", "non-STEM" = "grey45")) +
+  scale_shape_manual(values = c("STEM" = 17, "non-STEM" = 16)) +
+  labs(x = "Proportion of teams filling the role", y = NULL, colour = NULL, shape = NULL)
+ggsave(file.path(fig_dir, "fig2_role_importance.png"), fig2, width = 7.5, height = 5, dpi = 600)
+fig2
+```
+
+```{r fig3}
+role_sharing <- df_students %>%
+  count(team_id, year, team_gender, team_size, role, name = "n_holders") %>%
+  mutate(shared = as.integer(n_holders > 1)) %>%
+  group_by(team_gender, team_size, role) %>%
+  summarise(prop_shared = mean(shared), n_teams_filled = n(), .groups = "drop") %>%
+  filter(team_gender %in% pure3) %>% mutate(team_gender = factor(team_gender, levels = pure3))
+save_tab(role_sharing, "Fig3_role_sharing.csv")
+
+fig3 <- ggplot(role_sharing, aes(role, factor(team_size), fill = prop_shared)) +
+  geom_tile(colour = "white") + facet_wrap(~ team_gender) +
+  scale_fill_viridis_c(option = "magma", limits = c(0, NA), name = "Proportion shared") +
+  scale_x_discrete(labels = role_labels, guide = guide_axis(angle = 45)) +
+  labs(x = NULL, y = "Team size") +
+  guides(fill = guide_colourbar(title.position = "left", title.vjust = 0.9,
+                                barwidth = grid::unit(6, "cm"), barheight = grid::unit(0.4, "cm"))) +
+  theme(legend.position = "top")
+ggsave(file.path(fig_dir, "fig3_role_sharing.png"), fig3, width = 9, height = 4.5, dpi = 600)
+fig3
+```
+
+## 4. Question 1 — science-topic interests (Table 2)
+
+Per-field binomial GLMM (`present ~ team_gender + (1 | school_id)`) among the
+three focal compositions.
+
+```{r topics}
+FIELDS <- c("Biological","Chemical","Physical","Earth_and_Space","DAT")
+tg_lookup <- df_teams %>% dplyr::select(team_id, school_id, team_gender)
+
+dat_top <- topics %>%
+  filter(question == "learn_more") %>%
+  inner_join(tg_lookup, by = "team_id") %>%
+  filter(team_gender %in% pure3) %>%
+  mutate(team_gender = factor(team_gender, levels = pure3))
+
+# prevalence by group
+prev <- dat_top %>%
+  pivot_longer(all_of(FIELDS), names_to = "field", values_to = "present") %>%
+  group_by(field, team_gender) %>%
+  summarise(pct = 100 * mean(present), teams = n(), .groups = "drop")
+save_tab(prev, "ST_prevalence_by_group.csv")
+print(prev %>% pivot_wider(names_from = team_gender, values_from = pct, id_cols = field))
+
+# per-field GLMM contrasts, Holm/BH controlled across contrasts
+fit_field <- function(f) {
+  s <- dat_top %>% transmute(present = .data[[f]], team_gender, school_id)
+  out <- tryCatch({
+    m <- glmmTMB(present ~ team_gender + (1 | school_id), family = binomial, data = s)
+    as.data.frame(pairs(emmeans(m, ~ team_gender), type = "response")) %>%
+      transmute(field = f, contrast, odds.ratio, p.value)
+  }, error = function(e) tibble(field = f, contrast = NA, odds.ratio = NA, p.value = NA))
+  out
+}
+# Holm/BH across ALL field x contrast tests within the question (15 tests),
+# matching the published Table 2.
+st_contrasts <- map_dfr(FIELDS, fit_field) %>%
+  mutate(p_holm = p.adjust(p.value, "holm"),
+         p_BH   = p.adjust(p.value, "BH"))
+save_tab(st_contrasts, "ST_glmm_contrasts.csv")
+print(st_contrasts %>% filter(str_detect(contrast, "only girls / only boys")))
+```
+
+## 5. Individual STEM uptake and its amplification by mixing (Figure 4; Table 5)
+
+```{r fu6}
+df_did <- df_students %>%
+  filter(team_gender %in% pure3, gender_adj %in% c("female","male")) %>% droplevels() %>%
+  mutate(in_mixed   = factor(if_else(team_gender == "mixed", "mixed", "single-sex"),
+                             levels = c("single-sex","mixed")),
+         gender_adj = relevel(factor(gender_adj), ref = "female"))
+
+m_did <- glmmTMB(stem ~ gender_adj * in_mixed + scale(team_size) + year +
+                   (1 | school_id) + (1 | team_id), family = binomial, data = df_did)
+
+emm_cell <- as.data.frame(emmeans(m_did, ~ gender_adj | in_mixed, type = "response"))
+save_tab(emm_cell, "FU6_cell_probs.csv"); print(emm_cell)
+
+ix  <- summary(m_did)$coef$cond
+amp <- ix[grepl("gender_adjmale:in_mixedmixed", rownames(ix)), ]
+amp_or <- exp(amp["Estimate"])
+cat(sprintf("Amplification (gender x mixed) OR = %.2f [%.2f, %.2f], p = %.3g\n",
+            amp_or, exp(amp["Estimate"] - 1.96*amp["Std. Error"]),
+            exp(amp["Estimate"] + 1.96*amp["Std. Error"]), amp["Pr(>|z|)"]))
+save_tab(data.frame(term = "gender_adjmale:in_mixedmixed", OR = amp_or,
+                    lower = exp(amp["Estimate"]-1.96*amp["Std. Error"]),
+                    upper = exp(amp["Estimate"]+1.96*amp["Std. Error"]),
+                    p = amp["Pr(>|z|)"]), "FU6_amplification.csv")
+
+# per-gender effect of being in a mixed team
+fu6_each <- map_dfr(c("female","male"), function(gg) {
+  d  <- df_did %>% filter(gender_adj == gg) %>% droplevels()
+  mm <- glmmTMB(stem ~ in_mixed + scale(team_size) + year + (1 | school_id) + (1 | team_id),
+                family = binomial, data = d)
+  co <- summary(mm)$coef$cond["in_mixedmixed", ]
+  tibble(gender = gg, in_mixed_OR = exp(co["Estimate"]),
+         lower = exp(co["Estimate"]-1.96*co["Std. Error"]),
+         upper = exp(co["Estimate"]+1.96*co["Std. Error"]), p = co["Pr(>|z|)"])
+})
+save_tab(fu6_each, "FU6_per_gender.csv"); print(fu6_each)
+
+fig4 <- emm_cell %>%
+  mutate(gender_adj = factor(gender_adj, levels = c("female","male")),
+         in_mixed = factor(in_mixed, levels = c("single-sex","mixed"))) %>%
+  ggplot(aes(in_mixed, prob, colour = gender_adj, shape = gender_adj, group = gender_adj)) +
+  geom_line(linewidth = 1.1) +
+  geom_pointrange(aes(ymin = asymp.LCL, ymax = asymp.UCL), linewidth = 0.9, size = 0.9) +
+  # Okabe-Ito colourblind-safe pair + distinct shapes (merged into one legend)
+  scale_colour_manual(values = c(female = "#0072B2", male = "#D55E00"),
+                      labels = c(female = "Girls", male = "Boys"), name = NULL) +
+  scale_shape_manual(values = c(female = 16, male = 17),
+                     labels = c(female = "Girls", male = "Boys"), name = NULL) +
+  scale_x_discrete(labels = c("single-sex" = "Single-sex teams", "mixed" = "Mixed teams")) +
+  ylim(0, NA) +
+  labs(x = NULL, y = "P(member holds a STEM role)") +
+  theme(legend.position = c(0.16, 0.90),
+        legend.background = element_rect(fill = alpha("white", 0.6), colour = NA))
+ggsave(file.path(fig_dir, "fig4_amplification.png"), fig4, width = 8, height = 5.5, dpi = 600)
+fig4
+```
+
+### Within-mixed displacement (M3 / FU1) and the offset check
+
+```{r m3}
+df_mixed <- df_students %>% filter(team_gender == "mixed") %>% droplevels() %>%
+  mutate(gender_adj = relevel(factor(gender_adj), ref = "female"))
+
+m3 <- clogit(stem ~ gender_adj + strata(team_id), data = df_mixed)
+save_tab(broom::tidy(m3, exponentiate = TRUE, conf.int = TRUE), "M3_clogit.csv")
+print(broom::tidy(m3, exponentiate = TRUE, conf.int = TRUE))
+
+# permutation null: boys' share of filled STEM roles vs within-team reshuffles
+df_mixed_kg <- df_mixed %>% filter(gender_adj %in% c("female","male")) %>% droplevels()
+obs_boy_share <- with(df_mixed_kg, sum(stem == 1 & gender_adj == "male") / sum(stem == 1))
+set.seed(1234)
+perm <- replicate(1000, {
+  sh <- df_mixed_kg %>% group_by(team_id) %>% mutate(sp = sample(stem)) %>% ungroup()
+  with(sh, sum(sp == 1 & gender_adj == "male") / sum(sp == 1))
+})
+cat(sprintf("Observed boys' STEM share = %.3f; null mean = %.3f [%.3f, %.3f]; p = %.3f\n",
+            obs_boy_share, mean(perm), quantile(perm, .025), quantile(perm, .975),
+            mean(perm >= obs_boy_share)))
+
+# model-free deviation: observed vs expected girls in STEM across mixed teams
+fu1_dev <- df_students %>%
+  filter(team_gender == "mixed", gender_adj %in% c("female","male")) %>%
+  group_by(team_id) %>%
+  summarise(n_stem = sum(stem == 1),
+            obs_girls = sum(stem == 1 & gender_adj == "female"),
+            exp_girls = n_stem * mean(gender_adj == "female"), .groups = "drop") %>%
+  filter(n_stem > 0)
+cat(sprintf("Girls in STEM: observed %d vs expected %.1f (ratio %.3f), t-test p = %.3g\n",
+            sum(fu1_dev$obs_girls), sum(fu1_dev$exp_girls),
+            sum(fu1_dev$obs_girls)/sum(fu1_dev$exp_girls),
+            t.test(fu1_dev$obs_girls - fu1_dev$exp_girls)$p.value))
+save_tab(fu1_dev, "FU1_deviation_per_team.csv")
+
+# preference-offset clogit: boys' advantage net of single-sex baseline
+fu6_offset <- tryCatch({
+  base <- glmmTMB(stem ~ gender_adj + scale(team_size) + year + (1 | school_id),
+                  family = binomial, data = df_did %>% filter(in_mixed == "single-sex") %>% droplevels())
+  dmx <- df_did %>% filter(in_mixed == "mixed") %>% droplevels()
+  dmx$base_lp <- predict(base, newdata = dmx, re.form = NA, type = "link")
+  clogit(stem ~ gender_adj + strata(team_id) + offset(base_lp), data = dmx)
+}, error = function(e) { message("offset clogit skipped: ", conditionMessage(e)); NULL })
+if (!is.null(fu6_offset)) {
+  save_tab(broom::tidy(fu6_offset, exponentiate = TRUE, conf.int = TRUE), "FU6_offset_clogit.csv")
+  print(broom::tidy(fu6_offset, exponentiate = TRUE, conf.int = TRUE))
+}
+```
+
+### Does boys' advantage scale with boy-share or team size? (FU4)
+
+```{r fu4}
+df_mixed4 <- df_mixed %>% filter(gender_adj %in% c("female","male")) %>%
+  mutate(male = as.integer(gender_adj == "male"),
+         pb_z = as.numeric(scale(prop_boys)), ts_z = as.numeric(scale(team_size)))
+fu4 <- clogit(stem ~ male + male:pb_z + male:ts_z + strata(team_id), data = df_mixed4)
+save_tab(broom::tidy(fu4, exponentiate = TRUE, conf.int = TRUE), "FU4_clogit.csv")
+print(broom::tidy(fu4, exponentiate = TRUE, conf.int = TRUE))
+```
+
+## 6. Team-level STEM staffing (Table 4) and school-context adjustment (Figure 5)
+
+```{r fu2}
+pure_fill <- function(rl) df_fill %>% filter(role == rl, team_gender %in% pure3) %>%
+  mutate(team_gender = factor(team_gender, levels = pure3)) %>% droplevels()
+
+focal_or <- function(model, label) {
+  emm <- emmeans(model, ~ team_gender, at = list(team_gender = pure3))
+  contrast(emm, method = "pairwise", type = "response") %>% as.data.frame() %>%
+    filter(str_detect(contrast, "only girls")) %>%
+    transmute(model = label, contrast, odds.ratio, SE, z.ratio, p.value)
+}
+
+m_hs <- glmmTMB(filled ~ team_gender + scale(team_size) + year + (1 | school_id/class_id),
+                family = binomial, data = pure_fill("head_scientist"))
+m_ml <- glmmTMB(filled ~ team_gender + scale(team_size) + year + (1 | school_id/class_id),
+                family = binomial, data = pure_fill("mechanics_lead"))
+fu2_count <- df_fill %>% filter(stem == 1, team_gender %in% pure3) %>%
+  group_by(team_id, year, school_id, class_id, team_gender, team_size) %>%
+  summarise(n_offered = n(), n_filled = sum(filled), .groups = "drop") %>%
+  mutate(team_gender = factor(team_gender, levels = pure3), year = factor(year))
+m_cnt <- glmmTMB(cbind(n_filled, n_offered - n_filled) ~ team_gender + scale(team_size) + year +
+                   (1 | school_id/class_id), family = binomial, data = fu2_count)
+
+save_tab(as.data.frame(emmeans(m_hs, ~ team_gender, type = "response")), "FU2_HS_emmeans.csv")
+save_tab(as.data.frame(emmeans(m_ml, ~ team_gender, type = "response")), "FU2_ML_emmeans.csv")
+save_tab(as.data.frame(emmeans(m_cnt, ~ team_gender, type = "response")), "FU2_count_emmeans.csv")
+
+fu2_pairs <- bind_rows(focal_or(m_hs, "head_scientist"),
+                       focal_or(m_ml, "mechanics_lead"),
+                       focal_or(m_cnt, "stem_count")) %>%
+  mutate(p_holm = p.adjust(p.value, "holm"), p_BH = p.adjust(p.value, "BH"))
+save_tab(fu2_pairs, "FU2_multiplicity.csv"); print(fu2_pairs)
+```
+
+```{r fu3}
+# add school context and refit only-girls-vs-only-boys on the same complete cases
+refit_ob_ref <- function(d, covars = character(0)) {
+  d <- d %>% filter(team_gender %in% pure3) %>%
+    mutate(team_gender = factor(team_gender, levels = pure3)) %>% droplevels()
+  terms <- c("team_gender", "scale(team_size)")
+  if (n_distinct(d$year) > 1) terms <- c(terms, "year")
+  for (cv in covars) {
+    v <- d[[cv]]; ok <- if (is.numeric(v)) length(unique(v[!is.na(v)])) > 1 else n_distinct(v[!is.na(v)]) > 1
+    if (ok) terms <- c(terms, cv)
+  }
+  rhs <- paste(terms, collapse = " + ")
+  fit <- function(re) tryCatch(glmmTMB(as.formula(paste("filled ~", rhs, "+", re)),
+                                       family = binomial, data = d), error = function(e) NULL)
+  m <- fit("(1 | school_id/class_id)"); if (is.null(m)) m <- fit("(1 | school_id)"); m
+}
+onlygirls_effect <- function(model, label, n_teams) {
+  if (is.null(model)) return(tibble(model = label, n_teams = n_teams, or = NA, lower = NA, upper = NA, p = NA))
+  co <- summary(model)$coef$cond; rn <- rownames(co)[str_detect(rownames(co), "only girls")]
+  if (length(rn) != 1) return(tibble(model = label, n_teams = n_teams, or = NA, lower = NA, upper = NA, p = NA))
+  est <- co[rn, "Estimate"]; se <- co[rn, "Std. Error"]; p <- co[rn, "Pr(>|z|)"]
+  tibble(model = label, n_teams = n_teams, or = exp(est),
+         lower = exp(est - 1.96*se), upper = exp(est + 1.96*se), p = p)
+}
+
+fu3_rows <- list()
+for (rl in c("head_scientist","mechanics_lead")) {
+  adj_d <- df_fill %>% filter(role == rl) %>% left_join(school_ctx, by = "school_id") %>%
+    mutate(icsea_z = as.numeric(scale(school_icsea))) %>%
+    filter(!is.na(icsea_z), !is.na(sector), !is.na(locale), team_gender %in% pure3) %>%
+    mutate(team_gender = factor(team_gender, levels = pure3)) %>% droplevels()
+  n_used <- nrow(adj_d)
+  m_unadj <- refit_ob_ref(adj_d)
+  m_adj   <- refit_ob_ref(adj_d, covars = c("icsea_z","sector","locale"))
+  fu3_rows[[paste0(rl,"_unadj")]] <- onlygirls_effect(m_unadj, paste0(rl, " (unadjusted)"), n_used)
+  fu3_rows[[paste0(rl,"_adj")]]   <- onlygirls_effect(m_adj,   paste0(rl, " (+ school context)"), n_used)
+}
+fu3_compare <- bind_rows(fu3_rows)
+save_tab(fu3_compare, "FU3_onlygirls_before_after.csv"); print(fu3_compare)
+
+# Figure 5: forest of only-girls-vs-only-boys STEM-fill ORs (FU2 vs FU3)
+n_teams_of <- function(d) n_distinct(d$team_id)
+forest_dat <- bind_rows(
+  onlygirls_effect(m_hs,  "Head Scientist",     n_teams_of(pure_fill("head_scientist"))) %>% mutate(spec = "All teams"),
+  onlygirls_effect(m_ml,  "Mechanics Lead",     n_teams_of(pure_fill("mechanics_lead"))) %>% mutate(spec = "All teams"),
+  onlygirls_effect(m_cnt, "STEM roles staffed", n_teams_of(fu2_count)) %>% mutate(spec = "All teams"),
+  fu3_compare %>% filter(str_detect(model, "school context")) %>%
+    transmute(model = if_else(str_detect(model, "head_scientist"), "Head Scientist", "Mechanics Lead"),
+              n_teams, or, lower, upper, p, spec = "+ school context")) %>%
+  filter(!is.na(or)) %>%
+  mutate(model = factor(model, levels = c("STEM roles staffed","Mechanics Lead","Head Scientist")),
+         spec = factor(spec, levels = c("All teams","+ school context")),
+         sig = if_else(p < 0.05, "p < 0.05", "n.s."))
+save_tab(forest_dat, "FU_forest_data.csv")
+
+# two specs distinguished by BOTH colour and shape (colourblind-safe);
+# statistical significance shown by fill (solid = p < 0.05, hollow = n.s.)
+fig5 <- ggplot(forest_dat, aes(or, model, colour = spec, shape = spec, fill = sig)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_pointrange(aes(xmin = lower, xmax = upper), position = position_dodge(width = 0.55),
+                  linewidth = 0.8, size = 0.6, stroke = 0.9) +
+  scale_x_log10(breaks = c(0.05, 0.1, 0.25, 0.5, 1, 2)) +
+  scale_colour_manual(values = c("All teams" = "#0072B2", "+ school context" = "#D55E00")) +
+  scale_shape_manual(values = c("All teams" = 21, "+ school context" = 24)) +
+  scale_fill_manual(values = c("p < 0.05" = "grey20", "n.s." = "white")) +
+  labs(x = "Odds ratio (only girls / only boys), log scale", y = NULL,
+       colour = NULL, shape = NULL, fill = NULL) +
+  guides(colour = guide_legend(order = 1, override.aes = list(fill = "grey40")),
+         shape  = guide_legend(order = 1, override.aes = list(fill = "grey40")),
+         fill   = guide_legend(order = 2, override.aes = list(shape = 21, colour = "grey20")))
+ggsave(file.path(fig_dir, "fuA_onlygirls_forest.png"), fig5, width = 8.5, height = 4.5, dpi = 600)
+fig5
+```
+
+## 7. Per-role girls' uptake vs team girl-share (Figure 6)
+
+```{r fig6}
+holder_gender <- df_students %>% filter(gender_adj %in% c("female","male")) %>%
+  add_count(team_id, role, name = "n_holders_kg") %>% filter(n_holders_kg == 1) %>%
+  mutate(holder_girl = as.integer(gender_adj == "female"))
+save_tab(holder_gender %>% count(role, holder_girl), "Fig5_holder_gender_counts.csv")
+
+fig6 <- ggplot(holder_gender, aes(prop_girls, holder_girl)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_smooth(aes(colour = role), method = "glm", method.args = list(family = "binomial"),
+              se = FALSE, linewidth = 0.9) +
+  scale_colour_brewer(palette = "Dark2", name = NULL, labels = role_labels) +
+  labs(x = "Proportion of girls in team", y = "P(role held by a girl)") + ylim(0, 1) +
+  theme(legend.position = c(0.02, 0.98), legend.justification = c(0, 1),
+        legend.background = element_rect(fill = alpha("white", 0.6), colour = NA))
+ggsave(file.path(fig_dir, "fig5_perrole_girls_uptake.png"), fig6, width = 8, height = 5.5, dpi = 600)
+fig6
+```
+
+## 8. Sensitivity battery (FU5)
+
+```{r fu5}
+relabel_threshold <- function(t) roles %>%
+  mutate(gender_adj = if_else(!is.na(gender) & gender != "unknown" & gender_prob >= t, gender, "unknown"),
+         gender_adj = case_when(gender_adj == "unknown" & school_single_sex == "girls" ~ "female",
+                                gender_adj == "unknown" & school_single_sex == "boys"  ~ "male",
+                                TRUE ~ gender_adj))
+
+key_metrics <- function(long, label) {
+  f  <- build_frames(long)
+  dm <- f$df_students %>% filter(team_gender == "mixed", gender_adj %in% c("female","male")) %>%
+    droplevels() %>% mutate(gender_adj = relevel(factor(gender_adj), ref = "female"))
+  cl <- tryCatch(clogit(stem ~ gender_adj + strata(team_id), data = dm), error = function(e) NULL)
+  disp_or <- if (!is.null(cl)) exp(summary(cl)$coefficients["gender_adjmale","coef"]) else NA
+  disp_p  <- if (!is.null(cl)) summary(cl)$coefficients["gender_adjmale","Pr(>|z|)"] else NA
+  dhs <- f$df_fill %>% filter(role == "head_scientist", team_gender %in% pure3) %>%
+    mutate(team_gender = factor(team_gender, levels = pure3)) %>% droplevels()
+  hs_or <- NA; hs_p <- NA
+  if (all(c("only boys","only girls") %in% levels(dhs$team_gender))) {
+    dhs <- dhs %>% mutate(team_gender = relevel(team_gender, ref = "only boys"))
+    m <- tryCatch(glmmTMB(filled ~ team_gender + scale(team_size) + year + (1 | school_id/class_id),
+                          family = binomial, data = dhs), error = function(e) NULL)
+    if (!is.null(m)) { co <- summary(m)$coef$cond; rn <- rownames(co)[str_detect(rownames(co), "only girls")]
+      if (length(rn) == 1) { hs_or <- exp(co[rn,"Estimate"]); hs_p <- co[rn,"Pr(>|z|)"] } }
+  }
+  tibble(variant = label, n_mixed_teams = n_distinct(dm$team_id),
+         disp_boys_OR = as.numeric(disp_or), disp_p = as.numeric(disp_p),
+         HS_onlygirls_OR = as.numeric(hs_or), HS_onlygirls_p = as.numeric(hs_p))
+}
+
+fu5 <- bind_rows(
+  key_metrics(relabel_threshold(0.85), "threshold 0.85"),
+  key_metrics(roles,                   "threshold 0.90 (baseline)"),
+  key_metrics(relabel_threshold(0.95), "threshold 0.95"),
+  key_metrics(roles %>% filter(gender_adj != "unknown"), "drop unknown students"),
+  key_metrics(roles %>% filter(year != 2023),            "exclude 2023"),
+  key_metrics(roles %>% filter(school_single_sex == "coed" | is.na(school_single_sex)),
+              "exclude single-sex schools"))
+save_tab(fu5, "FU5_sensitivity.csv"); print(fu5)
+```
+
+## 9. Peer-conformity test: does all-girl label-avoidance scale with team size?
+
+Prediction (normative conformity): within all-girl teams, staffing of the
+*Head Scientist* label should fall as team size rises (a larger same-gender
+audience). Because larger teams mechanically fill more roles, the clean test is
+the `team_gender × team_size` interaction — only-girls teams should show a more
+negative team-size slope than only-boys/mixed. Mechanics Lead (scientific work,
+but not the loaded "scientist" label) is a placebo: the effect should be
+specific to Head Scientist.
+
+```{r peer-conformity}
+# descriptive: Head Scientist fill rate by composition x team size
+hs_desc <- df_fill %>%
+  filter(role == "head_scientist", team_gender %in% pure3) %>%
+  group_by(team_gender, team_size) %>%
+  summarise(n_teams = n(), fill_rate = mean(filled), .groups = "drop") %>%
+  arrange(team_gender, team_size)
+cat("\n=== Head Scientist fill rate by team_gender x team_size ===\n")
+print(hs_desc, n = Inf); save_tab(hs_desc, "PC_hs_fillrate_by_size.csv")
+
+# interaction model: team_size slope per composition (team_size numeric = per member)
+fit_size_int <- function(rl) {
+  d <- df_fill %>% filter(role == rl, team_gender %in% pure3) %>%
+    mutate(team_gender = factor(team_gender, levels = pure3), year = factor(year))
+  m <- glmmTMB(filled ~ team_gender * team_size + year + (1 | school_id/class_id),
+               family = binomial, data = d)
+  tr <- emtrends(m, ~ team_gender, var = "team_size")
+  list(trends = as.data.frame(summary(tr, infer = TRUE)),
+       interaction = as.data.frame(summary(contrast(tr, "revpairwise"), infer = TRUE)))
+}
+hs_int <- fit_size_int("head_scientist")   # focal
+ml_int <- fit_size_int("mechanics_lead")   # placebo
+cat("\n=== HEAD SCIENTIST: team_size slope by composition (log-odds / +1 member) ===\n")
+print(hs_int$trends, row.names = FALSE)
+cat("\n=== HEAD SCIENTIST: difference in slopes (interaction) ===\n")
+print(hs_int$interaction, row.names = FALSE)
+save_tab(hs_int$trends, "PC_hs_size_slopes.csv")
+save_tab(hs_int$interaction, "PC_hs_size_interaction.csv")
+cat("\n=== MECHANICS LEAD (placebo): team_size slope by composition ===\n")
+print(ml_int$trends, row.names = FALSE)
+print(ml_int$interaction, row.names = FALSE)
+save_tab(ml_int$trends, "PC_ml_size_slopes.csv")
+save_tab(ml_int$interaction, "PC_ml_size_interaction.csv")
+
+# direct within-all-girl slope, with Firth fallback (small n)
+og <- df_fill %>% filter(role == "head_scientist", team_gender == "only girls") %>%
+  mutate(year = factor(year))
+cat(sprintf("\nAll-girl Head-Scientist teams: %d (sizes %d-%d)\n",
+            nrow(og), min(og$team_size), max(og$team_size)))
+m_og <- tryCatch(glmmTMB(filled ~ team_size + year + (1 | school_id/class_id),
+                         family = binomial, data = og), error = function(e) NULL)
+if (!is.null(m_og)) { cat("\nWithin all-girl teams: P(HS filled) ~ team_size\n"); print(summary(m_og)$coef$cond) }
+if (requireNamespace("logistf", quietly = TRUE)) {
+  library(logistf)
+  fm <- if (dplyr::n_distinct(og$year) > 1) filled ~ team_size + year else filled ~ team_size
+  cat("\nFirth-penalised: all-girl P(HS filled) ~ team_size\n"); print(logistf(fm, data = og))
+}
+
+# figure
+pc_fig <- ggplot(hs_desc, aes(team_size, fill_rate, colour = team_gender, shape = team_gender)) +
+  geom_line(linewidth = 1) + geom_point(aes(size = n_teams)) +
+  scale_colour_manual(values = c("only boys" = "#0072B2", "mixed" = "grey45", "only girls" = "#D55E00")) +
+  scale_shape_manual(values = c("only boys" = 15, "mixed" = 16, "only girls" = 17)) +
+  scale_size_continuous(range = c(2, 6), guide = "none") +
+  labs(x = "Team size", y = "P(Head Scientist role filled)", colour = NULL, shape = NULL) + ylim(0, 1)
+ggsave(file.path(fig_dir, "PC_hs_fill_by_size.png"), pc_fig, width = 7.5, height = 5, dpi = 600)
+pc_fig
+```
+
+Directional cluster bootstrap (linear-probability slope, for sign/robustness
+only — not the primary estimate): resample teams with replacement and record how
+often the predicted negative slope is reproduced.
+
+```{r pc-bootstrap}
+set.seed(1234)
+lpm_slope <- function(d) if (dplyr::n_distinct(d$team_size) < 2) NA_real_ else
+  unname(coef(lm(filled ~ team_size, data = d))["team_size"])
+boot_slope <- function(d, B = 3000) replicate(B, lpm_slope(d[sample(nrow(d), replace = TRUE), ]))
+
+hs_pure <- df_fill %>% filter(role == "head_scientist", team_gender %in% pure3)
+og_hs <- hs_pure %>% filter(team_gender == "only girls")
+mx_hs <- hs_pure %>% filter(team_gender == "mixed")
+ob_hs <- hs_pure %>% filter(team_gender == "only boys")
+ml_og <- df_fill %>% filter(role == "mechanics_lead", team_gender == "only girls")
+
+b_og <- boot_slope(og_hs); b_mx <- boot_slope(mx_hs); b_ob <- boot_slope(ob_hs); b_ml <- boot_slope(ml_og)
+pc_boot <- tibble(
+  quantity = c("HS only-girls slope", "HS only girls - mixed",
+               "HS only girls - boys", "ML only-girls slope (placebo)"),
+  p_negative = c(mean(b_og < 0, na.rm = TRUE), mean(b_og - b_mx < 0, na.rm = TRUE),
+                 mean(b_og - b_ob < 0, na.rm = TRUE), mean(b_ml < 0, na.rm = TRUE)),
+  median = c(median(b_og, na.rm = TRUE), median(b_og - b_mx, na.rm = TRUE),
+             median(b_og - b_ob, na.rm = TRUE), median(b_ml, na.rm = TRUE)))
+print(pc_boot); save_tab(pc_boot, "PC_bootstrap_direction.csv")
+```
+
+## 10. Supplementary figures
+
+```{r figS1}
+# Figure S1: distribution of name-to-gender confidence, one value per student
+students_conf <- roles %>%
+  filter(team_id %in% df_teams$team_id) %>%
+  group_by(team_id, student_id) %>% slice(1) %>% ungroup() %>%
+  filter(!is.na(gender_prob))
+
+figS1 <- ggplot(students_conf, aes(gender_prob)) +
+  geom_histogram(binwidth = 0.025, boundary = 0.5, fill = "grey55", colour = "white") +
+  geom_vline(xintercept = 0.90, colour = "#D55E00", linetype = "dashed", linewidth = 1) +
+  annotate("text", x = 0.90, y = Inf, label = "0.90 threshold", colour = "#D55E00",
+           hjust = -0.05, vjust = 1.6, size = 4.2) +
+  coord_cartesian(xlim = c(0.5, 1.0)) +
+  labs(x = "Name-to-gender confidence", y = "Number of students")
+ggsave(file.path(fig_dir, "figS1_gender_confidence.png"), figS1, width = 7, height = 4.5, dpi = 600)
+figS1
+```
+
+```{r figS2}
+# Figure S2: number of (non-custom) roles held per student, analysed teams
+figS2_dat <- df_students %>% count(team_id, student_id, name = "n_roles") %>%
+  count(n_roles) %>% mutate(prop = n / sum(n))
+cat(sprintf("Students holding >1 role: %d of %d (%.1f%%)\n",
+            sum(figS2_dat$n[figS2_dat$n_roles > 1]), sum(figS2_dat$n),
+            100 * sum(figS2_dat$n[figS2_dat$n_roles > 1]) / sum(figS2_dat$n)))
+
+figS2 <- ggplot(figS2_dat, aes(factor(n_roles), prop)) +
+  geom_col(fill = "#4c72b0", colour = "white", width = 0.7) +
+  geom_text(aes(label = sprintf("%.1f%%\n(n = %d)", 100 * prop, n)), vjust = -0.3, size = 3.8) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = "Number of roles held by a student", y = "Proportion of students")
+ggsave(file.path(fig_dir, "figS2_multiple_roles.png"), figS2, width = 7, height = 4.5, dpi = 600)
+figS2
+```
+
+```{r figS3}
+# Figure S3: individual STEM uptake vs team boy-share, by gender (model-free bins).
+# Per-capita uptake declines with boy-share for BOTH genders (dilution) -- this is
+# why the M1 individual-uptake model is descriptive, not the headline test.
+figS3_dat <- df_students %>%
+  filter(gender_adj %in% c("female","male")) %>% droplevels() %>%
+  mutate(pb_bin = cut(prop_boys, breaks = seq(0, 1, 0.2), include.lowest = TRUE)) %>%
+  group_by(gender_adj, pb_bin) %>%
+  summarise(mid = mean(prop_boys), rate = mean(stem), n = n(), .groups = "drop")
+
+figS3 <- ggplot(figS3_dat, aes(mid, rate, colour = gender_adj, shape = gender_adj)) +
+  geom_line(linewidth = 1) +
+  geom_point(aes(size = n)) +
+  scale_colour_manual(values = c(female = "#0072B2", male = "#D55E00"),
+                      labels = c(female = "Girls", male = "Boys"), name = NULL) +
+  scale_shape_manual(values = c(female = 16, male = 17),
+                     labels = c(female = "Girls", male = "Boys"), name = NULL) +
+  scale_size_continuous(range = c(2, 6), guide = "none") +
+  ylim(0, NA) +
+  labs(x = "Proportion of boys in team (gender-known members)",
+       y = "P(student takes a STEM role)") +
+  theme(legend.position = c(0.85, 0.92),
+        legend.background = element_rect(fill = alpha("white", 0.6), colour = NA))
+ggsave(file.path(fig_dir, "figS3_individual_uptake.png"), figS3, width = 7.5, height = 5, dpi = 600)
+figS3
+```
+
+## 11. Reproducibility
+
+Record the exact package versions used, both as a human-readable session dump
+(`session_info.txt`) and a machine-readable manifest (`package_versions.csv`),
+so the analysis can be reproduced against a known software stack.
+
+```{r session}
+sessionInfo()
+
+pkgs <- c("tidyverse", "dplyr", "ggplot2", "tidyr", "readr", "purrr", "tibble",
+          "stringr", "forcats", "glmmTMB", "emmeans", "survival", "broom", "logistf")
+versions <- data.frame(
+  package = c("R", pkgs),
+  version = c(paste(R.version$major, R.version$minor, sep = "."),
+              vapply(pkgs, function(p) tryCatch(as.character(packageVersion(p)),
+                                                error = function(e) NA_character_), character(1))),
+  row.names = NULL)
+print(versions)
+write.csv(versions, file.path(tab_dir, "package_versions.csv"), row.names = FALSE)
+writeLines(capture.output(sessionInfo()), "session_info.txt")
+```

@@ -1,0 +1,24 @@
+# --- identifiable inputs: NEVER commit -------------------------------------
+raw/*
+!raw/.gitkeep
+private/*
+!private/.gitkeep
+
+# --- rendered / transient outputs ------------------------------------------
+analysis.html
+analysis_files/
+/.quarto/
+*_cache/
+
+# --- R / RStudio -----------------------------------------------------------
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# --- OS ---------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+
+# knitr chunk-duplicate figures (the named ggsave PNGs are canonical)
+output/figures/*-1.png
